@@ -2,23 +2,28 @@ CS 214 Project III: A Simple Shell
 
 Partners
 --------
-Ali Ahsanuddin (aa3281)
-Almer Capella (ac2945)
+aa3281
+ac2945
 
-Build
------
-Run `make` to build `mysh`.
+Design notes
+------------
+The program reads commands with read() and uses the same loop for interactive
+and batch modes. It splits each command into tokens and stores the arguments
+in resizable lists. The shell uses fork(), execv(), waitpid(), pipe(), and
+dup2() to run commands and pipelines.
 
-Test plan
----------
-Run `make test` to execute tests/run_tests.sh. The test suite checks:
+The built-in commands are cd, pwd, which, and exit. Other commands are
+searched for in /usr/local/bin, /usr/bin, and /bin. The program supports input
+and output redirection. In batch mode, child processes use /dev/null for
+standard input.
 
-* external commands and the shell's always-successful exit status;
-* the cd, pwd, which, and exit built-ins;
-* input redirection, truncating output redirection, and append redirection;
-* pipelines and the status of the final pipeline command;
-* wildcard expansion, including the no-match case;
-* comments, empty commands, syntax errors, missing commands, and command
-  arguments containing spaces;
-* batch-mode input from a file and the required /dev/null standard input for
-  child processes.
+Wildcard tokens are expanded by looking through the correct directory.
+Comments, empty commands, syntax errors, and wildcards with no matches are
+also handled.
+
+Testing strategy
+----------------
+The test script checks external commands, the built-in commands, input and
+output redirection, pipelines, and wildcard expansion. It also checks comments,
+empty commands, syntax errors, missing commands, batch-mode input from a file,
+and the /dev/null standard input used by child processes.
