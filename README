@@ -1,1 +1,24 @@
-# CS214_P3
+CS 214 Project III: A Simple Shell
+
+Partners
+--------
+Ali Ahsanuddin (aa3281)
+Almer Capella (ac2945)
+
+Build
+-----
+Run `make` to build `mysh`.
+
+Test plan
+---------
+Run `make test` to execute tests/run_tests.sh. The test suite checks:
+
+* external commands and the shell's always-successful exit status;
+* the cd, pwd, which, and exit built-ins;
+* input redirection, truncating output redirection, and append redirection;
+* pipelines and the status of the final pipeline command;
+* wildcard expansion, including the no-match case;
+* comments, empty commands, syntax errors, missing commands, and command
+  arguments containing spaces;
+* batch-mode input from a file and the required /dev/null standard input for
+  child processes.

@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef struct {
@@ -47,6 +49,8 @@ typedef struct {
     int  signal;
     bool exit_requested;
 } result_t;
+
+static char *get_cwd(void);
 
 static void al_init(arraylist_t *l)
 {
@@ -239,7 +243,7 @@ static void glob_expand(const char *pattern, arraylist_t *out)
 
 static int is_space(char c)
 {
-    return c == ' ' || c == '\t' || c == '\r';
+    return isspace((unsigned char)c);
 }
 
 static int is_special(char c)
@@ -382,27 +386,243 @@ static parse_status_t parse_line(const char *line, job_t *job)
     return PARSE_OK;
 }
 
+static bool is_builtin(const char *name)
+{
+    return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0
+        || strcmp(name, "which") == 0 || strcmp(name, "exit") == 0;
+}
+
+static char *find_program(const char *name)
+{
+    static const char *dirs[] = {"/usr/local/bin", "/usr/bin", "/bin"};
+
+    if (strchr(name, '/'))
+        return access(name, X_OK) == 0 ? strdup(name) : NULL;
+
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        size_t len = strlen(dirs[i]) + strlen(name) + 2;
+        char *path = malloc(len);
+        if (!path)
+            return NULL;
+        snprintf(path, len, "%s/%s", dirs[i], name);
+        if (access(path, X_OK) == 0)
+            return path;
+        free(path);
+    }
+    return NULL;
+}
+
+static int open_input(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        dprintf(STDERR_FILENO, "%s: %s\n", path, strerror(errno));
+    return fd;
+}
+
+static int open_output(const subcmd_t *cmd)
+{
+    int flags = O_WRONLY | O_CREAT | (cmd->append ? O_APPEND : O_TRUNC);
+    int fd = open(cmd->outfile, flags | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP);
+    if (fd < 0)
+        dprintf(STDERR_FILENO, "%s: %s\n", cmd->outfile, strerror(errno));
+    return fd;
+}
+
+static int apply_redirections(const subcmd_t *cmd)
+{
+    if (cmd->infile) {
+        int fd = open_input(cmd->infile);
+        if (fd < 0 || dup2(fd, STDIN_FILENO) < 0) {
+            if (fd >= 0)
+                close(fd);
+            return -1;
+        }
+        close(fd);
+    }
+    if (cmd->outfile) {
+        int fd = open_output(cmd);
+        if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+            if (fd >= 0)
+                close(fd);
+            return -1;
+        }
+        close(fd);
+    }
+    return 0;
+}
+
+static int builtin_which(const subcmd_t *cmd)
+{
+    int status = cmd->argc > 1 ? 0 : 1;
+    for (int i = 1; i < cmd->argc; i++) {
+        char *path = find_program(cmd->argv[i]);
+        if (path) {
+            dprintf(STDOUT_FILENO, "%s\n", path);
+            free(path);
+        } else {
+            status = 1;
+        }
+    }
+    return status;
+}
+
+static int run_builtin(const subcmd_t *cmd)
+{
+    if (strcmp(cmd->argv[0], "cd") == 0) {
+        if (cmd->argc > 2) {
+            dprintf(STDERR_FILENO, "cd: too many arguments\n");
+            return 1;
+        }
+        const char *dir = cmd->argc == 1 ? getenv("HOME") : cmd->argv[1];
+        if (!dir || chdir(dir) < 0) {
+            dprintf(STDERR_FILENO, "cd: %s: %s\n",
+                    dir ? dir : "HOME is not set", strerror(errno));
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(cmd->argv[0], "pwd") == 0) {
+        char *cwd = getcwd(NULL, 0);
+        if (!cwd) {
+            dprintf(STDERR_FILENO, "pwd: %s\n", strerror(errno));
+            return 1;
+        }
+        dprintf(STDOUT_FILENO, "%s\n", cwd);
+        free(cwd);
+        return 0;
+    }
+    if (strcmp(cmd->argv[0], "which") == 0)
+        return builtin_which(cmd);
+    return 0;
+}
+
+static void run_child(const subcmd_t *cmd, bool interactive, int input_fd,
+                      int output_fd)
+{
+    if (input_fd >= 0 && dup2(input_fd, STDIN_FILENO) < 0)
+        _exit(EXIT_FAILURE);
+    if (output_fd >= 0 && dup2(output_fd, STDOUT_FILENO) < 0)
+        _exit(EXIT_FAILURE);
+
+    if (input_fd >= 0)
+        close(input_fd);
+    if (output_fd >= 0 && output_fd != input_fd)
+        close(output_fd);
+
+    if (!interactive && input_fd < 0 && !cmd->infile) {
+        int nullfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0)
+            _exit(EXIT_FAILURE);
+        close(nullfd);
+    }
+    if (apply_redirections(cmd) < 0)
+        _exit(EXIT_FAILURE);
+
+    if (is_builtin(cmd->argv[0]))
+        _exit(run_builtin(cmd));
+
+    char *path = find_program(cmd->argv[0]);
+    if (!path) {
+        dprintf(STDERR_FILENO, "mysh: %s: command not found\n", cmd->argv[0]);
+        _exit(127);
+    }
+    execv(path, cmd->argv);
+    dprintf(STDERR_FILENO, "mysh: %s: %s\n", cmd->argv[0], strerror(errno));
+    free(path);
+    _exit(126);
+}
+
+static result_t run_parent_builtin(const subcmd_t *cmd)
+{
+    result_t res = {0, 0, strcmp(cmd->argv[0], "exit") == 0};
+    int saved_in = dup(STDIN_FILENO);
+    int saved_out = dup(STDOUT_FILENO);
+    if (saved_in < 0 || saved_out < 0 || apply_redirections(cmd) < 0) {
+        res.exit_code = 1;
+    } else {
+        res.exit_code = run_builtin(cmd);
+    }
+    if (saved_in >= 0) {
+        dup2(saved_in, STDIN_FILENO);
+        close(saved_in);
+    }
+    if (saved_out >= 0) {
+        dup2(saved_out, STDOUT_FILENO);
+        close(saved_out);
+    }
+    return res;
+}
+
 static result_t run_job(const job_t *job, bool interactive)
 {
-    (void)interactive;
     result_t res = {0, 0, false};
+    if (job->ncmds == 1 && is_builtin(job->cmds[0].argv[0]))
+        return run_parent_builtin(&job->cmds[0]);
 
-    for (int i = 0; i < job->ncmds; i++) {
-        const subcmd_t *c = &job->cmds[i];
-        dprintf(STDOUT_FILENO, "cmd %d: argc=%d argv=", i, c->argc);
-        for (int j = 0; c->argv[j]; j++)
-            dprintf(STDOUT_FILENO, "[%s]", c->argv[j]);
-        if (c->infile)
-            dprintf(STDOUT_FILENO, " in=[%s]", c->infile);
-        if (c->outfile)
-            dprintf(STDOUT_FILENO, " %s=[%s]", c->append ? "append" : "out", c->outfile);
-        dprintf(STDOUT_FILENO, "\n");
-
-        if (strcmp(c->argv[0], "exit") == 0)
-            res.exit_requested = true;
-        if (strcmp(c->argv[0], "false") == 0)
-            res.exit_code = 1;
+    int n = job->ncmds;
+    int (*pipes)[2] = n > 1 ? calloc((size_t)n - 1, sizeof(*pipes)) : NULL;
+    pid_t *pids = calloc((size_t)n, sizeof(*pids));
+    if (!pids || (n > 1 && !pipes)) {
+        perror("calloc");
+        free(pipes);
+        free(pids);
+        res.exit_code = 1;
+        return res;
     }
+    for (int i = 0; i < n - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
+            perror("pipe");
+            for (int j = 0; j < i; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            free(pipes);
+            free(pids);
+            res.exit_code = 1;
+            return res;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        int in = i > 0 ? pipes[i - 1][0] : -1;
+        int out = i < n - 1 ? pipes[i][1] : -1;
+        pids[i] = fork();
+        if (pids[i] == 0) {
+            for (int j = 0; j < n - 1; j++) {
+                if (pipes[j][0] != in)
+                    close(pipes[j][0]);
+                if (pipes[j][1] != out)
+                    close(pipes[j][1]);
+            }
+            run_child(&job->cmds[i], interactive, in, out);
+        }
+        if (pids[i] < 0)
+            dprintf(STDERR_FILENO, "mysh: fork: %s\n", strerror(errno));
+    }
+    for (int i = 0; i < n - 1; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    for (int i = 0; i < n; i++) {
+        int status;
+        if (pids[i] <= 0 || waitpid(pids[i], &status, 0) < 0) {
+            res.exit_code = 1;
+            continue;
+        }
+        if (i == n - 1) {
+            if (WIFEXITED(status))
+                res.exit_code = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status))
+                res.signal = WTERMSIG(status);
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (strcmp(job->cmds[i].argv[0], "exit") == 0)
+            res.exit_requested = true;
+    free(pipes);
+    free(pids);
     return res;
 }
 
@@ -488,8 +708,13 @@ int main(int argc, char **argv)
 
         job_t job;
         parse_status_t ps = parse_line(line, &job);
-        if (ps != PARSE_OK)
+        if (ps == PARSE_EMPTY)
             continue;
+        if (ps == PARSE_ERROR) {
+            if (interactive)
+                report_status((result_t){1, 0, false});
+            continue;
+        }
 
         result_t res = run_job(&job, interactive);
         free_job(&job);
